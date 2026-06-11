@@ -1,0 +1,156 @@
+# Agent instructions for `spancodec`
+
+Go library (**MIT**), merger of spanenc and spandec: convert plain Go values
+to `spanner.GenericColumnValue` (GCV) and back. **Encoding MIRRORS the
+client library's internal encoding semantics** (re-audited per client
+release); **decoding DELEGATES to the client** and only extends destination
+shapes the client rejects (extensions are RETIRED when upstream fixes land). Built on [`spanvalue/gcvctor`](https://github.com/apstndb/spanvalue),
+[`spantype/typector`](https://github.com/apstndb/spantype), and
+[`structfields`](https://github.com/apstndb/structfields) (the Apache-2.0
+exported fork of `cloud.google.com/go/internal/fields`; all upstream-derived
+code lives THERE, never here — spancodec mirrors behavior with independent
+code only). Alias **`sppb`** = `cloud.google.com/go/spanner/apiv1/spannerpb`.
+
+## Commands
+
+Tasks and tool versions live in **`mise.toml`** (`go`, `golangci-lint`).
+Prefer **`mise run check`** (fmt-check, vet, build, test, lint); also
+`mise run test-race`, `mise run fmt`. The `Makefile` is a thin wrapper
+delegating to mise. CI (`.github/workflows/go.yml`) runs the same tasks via
+`jdx/mise-action`; keep action versions current (mise-action v4+, checkout v6+).
+
+## Upstream mirror policy (core invariant)
+
+This package is a **behavioral derivative of `cloud.google.com/go/spanner`**;
+the mirrored behavior currently tracks **v1.91.0**. Sources of truth in the
+module cache:
+
+| spancodec | upstream (value.go / mutation.go) |
+|---------|-----------------------------------|
+| `ValueOf` (encode.go) | `encodeValue` type-switch cases, in the same order |
+| `convertCustomValue` / `customBaseGoType` (typeof.go) | `getDecodableSpannerType` + `convertCustomTypeValue` (encode half) |
+| `encodeStructValue` | `encodeStruct` (declaration order, embedded rejected, tag via `Lookup` so `spanner:""` = unnamed field) |
+| `structFields` / `fieldCache` (struct.go) | `fieldCache` + `spannerTagParser` (tag via `Get`; `;`-separated options, `->`/`readonly` = read-only since v1.86.0) |
+| `validateNumeric` | `validateNumeric` (same algorithm, independent expression; default NumericError handling) |
+| `github.com/apstndb/structfields` (dependency) | **exported fork of `cloud.google.com/go/internal/fields`** — upstream-derived code lives in that ASL2 module, keeping spancodec MIT |
+
+When re-auditing against a newer spanner release: diff these functions
+against upstream, update the tracked version in `doc.go` and `README.md`, and
+extend `exactGoTypes` (typeof.go) together with the `ValueOf` switch — the
+test suite cross-checks `TypeFromGoType` against `ValueOf` results.
+
+**Mirrored-semantics version ≠ go.mod requirement.** `go.mod` declares only
+the minimum spanner version whose APIs the code uses (currently the v1.84.1
+floor inherited from spanvalue) so downstreams control the client version
+under MVS; do NOT bump it just because the audited semantics version moved.
+The `latest-deps` CI job tests against spanner@latest to catch drift.
+
+Mirrored quirks are deliberate (do not "fix"): `==` sentinel comparison for
+`spanner.CommitTimestamp`; nil named UUID-array slices converting to an empty
+`[]uuid.UUID`; two different struct field listings (row-shaped = flattened
+embedded; STRUCT values = embedded rejected); encodeStruct reads the raw tag,
+so tag options leak verbatim into STRUCT field names (`"Name;readonly"`);
+read-only fields stay in read-shaped listings (StructColumns / RowTypeFor /
+StructColumnsAndValues) and are excluded only from Mutation* helpers, like
+structToMutationParams; dead `Ptr` branch parity in `customBaseGoType`.
+
+## Deliberate divergences (documented in doc.go; keep them)
+
+Strictness so malformed GCVs never enter the spanvalue stack: untyped nil →
+`ErrUntypedNil`; nil struct pointer in row-shaped helpers →
+`ErrNilStructPointer`; GCV input with nil Type rejected; NUMERIC
+loss-of-precision is per-call (`WithLossOfPrecisionHandling`, default
+NumericError) and NEVER reads the client's package-global
+`spanner.LossOfPrecisionHandling` (whose default is NumericRound); non-finite
+floats and JSON use gcvctor canonical wire forms (strings / unescaped JSON)
+instead of the client's NumberValue / HTML-escaped JSON.
+
+## API map
+
+- `ValueOf` — Go value → GCV (encodeValue mirror).
+- `TypeFor[T]` / `TypeFromGoType` (`opts ...EncodeOption`) — static type
+  inference; `ErrTypeNotInferable` for Encoder/GCV/NullProto*/interface
+  types (value-dependent). `WithGoType` registrations win over inference
+  (fresh clone returned) and resolve `[]T` via the element registration;
+  RowTypeFor/RowTypeFromGoType/ResultSetMetadata* take the same opts.
+- `StructColumns[T]` / `StructColumnsFromGoType` — column names
+  ([googleapis/google-cloud-go#13800](https://github.com/googleapis/google-cloud-go/issues/13800)).
+- `RowTypeFor[T]` / `RowTypeFromGoType` — `*sppb.StructType` for writer metadata.
+- `StructColumnsAndValues` — struct → columns + GCVs (spanvalue/writer
+  `WriteValues`).
+- `MutationColumnsAndValues` / `MutationMap` — struct → plain Go cols/vals or
+  map for `spanner.Insert/Update/Replace(...)` / `*Map` constructors; column
+  masks via `WithColumns` (include) / `WithoutColumns` (exclude), strict
+  (`ErrInvalidColumnMask` on unknown/read-only-in-include/combined). Values
+  are NOT GCV-encoded (the client encodes them).
+- `ParamsMap` — struct → plain Go map for `spanner.Statement` Params;
+  read-shaped (read-only fields included, include mask may name them); same
+  mask options.
+- `ResultSetMetadataFor[T]` / `ResultSetMetadataFromGoType` — RowTypeFor
+  wrapped in `*sppb.ResultSetMetadata` (writer `WithMetadata`, virtual
+  result sets).
+- `RowEncoder[T]` (`NewRowEncoder(opts ...RowEncoderOption)`) — compiled
+  read-shaped row codec: listing/mask/row type resolved once.
+  `RowEncoderOption` is the union interface satisfied by BOTH
+  `ColumnMaskOption` and `EncodeOption` (construction-time
+  WithValueEncoder/WithGoType inform RowType/ResultSetMetadata; per-call
+  Values opts layer on a map-cloned copy — encoder state never mutates, so
+  concurrent use is safe). `Columns` / `RowType` / `ResultSetMetadata`
+  (+`MustResultSetMetadata`; Must construction does not guarantee an
+  inferable row type) / `Values(v, encodeOpts...)` / `Row(v, ...)`
+  (→ `*spanner.Row` via `spanner.NewRow` GCV passthrough) /
+  `Rows(items, ...)` (lazy `iter.Seq2[*spanner.Row, error]`).
+  Mask validated like ParamsMap (read-shaped); must stay consistent with
+  StructColumnsAndValues (test enforces).
+- `ValuesFromSlice[T]` / `ArrayValueFromSlice[T]` — homogeneous slices;
+  interface element types rejected via static inference; nil slice = typed
+  NULL ARRAY at the GCV level.
+- `WithValueEncoder[T]` / `WithGoType[T]` (EncodeOption, spanenc#5) —
+  per-call custom encoder injection for client-unsupported Go types
+  (uint32, time.Duration, external types); runs BEFORE the mirror,
+  `ErrFallthrough` defers to it; exact-type match (interface T panics);
+  applies per element of `[]T` (nil/empty need WithGoType); last
+  registration wins; NO package-global registry by design. Hazard:
+  registering time.Time bypasses the CommitTimestamp sentinel (pinned by
+  test).
+
+## Decode side (from spandec)
+
+- `Decode(gcv, ptr, opts...)` / `ToStruct(row, ptr, opts...)` — DELEGATE to
+  the client; `decodeExtended` handles only shapes the client rejects, each
+  tied to an upstream issue (retire when fixed upstream): `*T` named-scalar
+  pointers (googleapis/google-cloud-go#12576), `[]T` struct slices for
+  ARRAY<STRUCT> with `ErrNullStructElement` (#11090), `json.RawMessage` for
+  JSON columns (#10720). Tests pin each gap with a "client still fails"
+  subtest. ToStruct mirrors client strictness (unmatched/duplicate column =
+  error; exact then case-insensitive matching via fields.List.Match).
+- `WithValueDecoder[T]` (DecodeOption, spandec#1) — exact `*T` destination
+  match, consulted BEFORE decodeExtended and the client (can override the
+  extension shapes); shares `ErrFallthrough`; ARRAY into `*[]T` decodes per
+  element (NULL ARRAY → nil slice), elements re-enter `decode` so
+  per-element fallthrough works.
+
+## Tests
+
+`t.Parallel()`, `cmp.Diff` + `protocmp.Transform()`. Expected GCVs built from
+`typector` + `structpb`, not from the helpers under test. Keep: the
+ValueOf↔TypeFromGoType consistency check inside `TestValueOf`; decode
+round-trips through the real client's `GenericColumnValue.Decode`;
+`internal/fields` upstream tests (ported, `tEqual` replaces testutil).
+
+## Dependencies & releases
+
+- All dependencies are tagged releases (spanvalue v0.7.1+ is required for
+  gcvctor's UTC-timestamp wire format; `structfields` and its nested
+  `structfields/spannertag` module version independently).
+- Per-version truth: GitHub Releases (no in-repo CHANGELOG). Experimental
+  until encodeValue parity is proven; English only on github.com. Published
+  versions are immutable — never re-tag (proxy.golang.org caches
+  aggressively).
+- **Docs placement policy:** user-facing guidance lives in godoc (doc.go
+  sections, runnable Examples) so `go doc` / pkg.go.dev suffice; README is
+  a thin showcase pointing there. Version requirements (e.g. minimum
+  spanvalue) belong in each version's release notes, not README/godoc.
+- **Versioning policy: stay on v0.** Breaking changes bump the minor
+  version; non-breaking changes (features included) bump the patch version.
+  Pre-releases (`-alpha.N`) may precede either.

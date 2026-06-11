@@ -1,0 +1,221 @@
+// Package spancodec converts between plain Go values and
+// [cloud.google.com/go/spanner.GenericColumnValue] (GCV) values, following
+// the Cloud Spanner Go client library's own semantics in both directions.
+// It merges and supersedes github.com/apstndb/spanenc and
+// github.com/apstndb/spandec.
+//
+// The two directions carry different guarantees:
+//
+//   - Encoding MIRRORS the client. The client library keeps its encoding
+//     internal (encodeValue, structToMutationParams, and the internal
+//     fields cache); this package mirrors those semantics — the `spanner`
+//     struct tag rules and the Go type coverage of statement parameters
+//     and mutations — on top of [github.com/apstndb/spanvalue/gcvctor]
+//     constructors so the results compose with the spanvalue formatting
+//     and writer stack. The mirrored behavior tracks
+//     cloud.google.com/go/spanner v1.91.0.
+//   - Decoding DELEGATES to the client ([Decode], [ToStruct]): behavior is
+//     identical where the client already works, extended only for
+//     destination shapes the client rejects today (see "Decoding").
+//
+// # API overview
+//
+//   - [ValueOf]: Go value → GCV, mirroring encodeValue (typed NULLs from nil
+//     pointers and nil slices, spanner.Null* wrappers, spanner.Encoder,
+//     protobuf messages and enums, named variants of base types, Go structs
+//     as STRUCT values, spanner.CommitTimestamp).
+//   - [TypeFor] / [TypeFromGoType]: Go type →
+//     [cloud.google.com/go/spanner/apiv1/spannerpb.Type], the type half of
+//     [ValueOf] without a value.
+//   - [StructColumns] / [StructColumnsFromGoType]: `spanner`-tagged column
+//     names from a struct type, as requested in
+//     https://github.com/googleapis/google-cloud-go/issues/13800.
+//   - [RowTypeFor] / [RowTypeFromGoType] and [ResultSetMetadataFor] /
+//     [ResultSetMetadataFromGoType]: row-shaped
+//     [cloud.google.com/go/spanner/apiv1/spannerpb.StructType] /
+//     [cloud.google.com/go/spanner/apiv1/spannerpb.ResultSetMetadata] for
+//     writer metadata and client-side virtual result sets.
+//   - [StructColumnsAndValues]: one struct → column names + GCVs, for
+//     GCV-level consumers such as [github.com/apstndb/spanvalue/writer].
+//   - [RowEncoder] ([NewRowEncoder]): compiled row codec for streaming many
+//     rows of one struct type — field listing, column mask, and row type
+//     resolved once; per row only [RowEncoder.Values] runs.
+//     [RowEncoder.Row] / [RowEncoder.Rows] encode into real
+//     [cloud.google.com/go/spanner.Row] values so virtual result sets flow
+//     through the same *spanner.Row pipelines as server query results.
+//   - [MutationColumnsAndValues] / [MutationMap]: one struct → cols/vals or
+//     map with plain Go values, for the non-Struct mutation constructors
+//     ([cloud.google.com/go/spanner.Update],
+//     [cloud.google.com/go/spanner.UpdateMap], ...). An update-mask-style
+//     column mask can be written as an include list ([WithColumns]) or an
+//     exclude list ([WithoutColumns]).
+//   - [ParamsMap]: one struct → map with plain Go values for
+//     [cloud.google.com/go/spanner.Statement] Params; read-only fields are
+//     included (they are ordinary bindable values), and the same column
+//     masks apply.
+//   - [ValuesFromSlice] / [ArrayValueFromSlice]: homogeneous slices →
+//     (element type, wire values) or an ARRAY GCV; heterogeneous-capable
+//     (interface) element types are rejected.
+//   - [Decode] / [ToStruct]: GCV or [cloud.google.com/go/spanner.Row] →
+//     Go values, delegating to the client with extension shapes; see
+//     "Decoding".
+//   - [WithValueEncoder] / [WithGoType] / [WithValueDecoder]: per-call
+//     injection of codecs for Go types outside the client's coverage; see
+//     "Custom value codecs".
+//
+// # Struct field listings
+//
+// Following the client, there are two different struct field listings:
+//
+//   - Row-shaped helpers ([StructColumns], [RowTypeFor],
+//     [StructColumnsAndValues], [MutationColumnsAndValues], [MutationMap])
+//     use the mutation/ToStruct listing: exported fields, embedded struct
+//     fields flattened with Go's shadowing rules, `spanner:"-"` skipped,
+//     declaration order. Tags split on ";" with the column name first;
+//     `spanner:"->"` or a `readonly` part marks the field read-only (since
+//     spanner v1.86.0). Read-only fields stay in the read-shaped listings
+//     ([StructColumns], [RowTypeFor], [StructColumnsAndValues]) and are
+//     excluded from the write-shaped ones ([MutationColumnsAndValues],
+//     [MutationMap]), mirroring structToMutationParams.
+//   - STRUCT-typed values ([ValueOf] on a struct, [TypeFor]) use the
+//     encodeStruct listing: declaration order, embedded fields rejected with
+//     [ErrEmbeddedStructField], and `spanner:""` producing an unnamed field.
+//     encodeStruct reads the raw tag, so tag options leak into STRUCT field
+//     names verbatim (`spanner:"Name;readonly"` yields a field literally
+//     named "Name;readonly"); this mirrors the client.
+//
+// # Divergences from the client library
+//
+// This package is strict where the client is lenient, so malformed GCVs
+// never enter the spanvalue stack:
+//
+//   - Untyped nil returns [ErrUntypedNil]; the client sends a NULL without
+//     type information.
+//   - A nil pointer to struct passed to [MutationColumnsAndValues],
+//     [MutationMap], or [StructColumnsAndValues] returns
+//     [ErrNilStructPointer]; the client silently builds an empty mutation.
+//   - [cloud.google.com/go/spanner.GenericColumnValue] inputs with a nil
+//     Type are rejected.
+//   - NUMERIC loss-of-precision handling is an explicit per-call option
+//     ([WithLossOfPrecisionHandling], reusing the client's
+//     [cloud.google.com/go/spanner.LossOfPrecisionHandlingOption]
+//     vocabulary); the package-global
+//     [cloud.google.com/go/spanner.LossOfPrecisionHandling] is never read.
+//     The default is [cloud.google.com/go/spanner.NumericError] (validate),
+//     while the client's global defaults to NumericRound (silent rounding).
+//   - Non-finite FLOAT64/FLOAT32 values and JSON payloads use the canonical
+//     wire forms produced by [github.com/apstndb/spanvalue/gcvctor]
+//     ("NaN"/"Infinity" strings; compact JSON without HTML escaping); the
+//     client sends a raw protobuf NumberValue and HTML-escaped JSON. Both
+//     forms are semantically equivalent and accepted by Spanner.
+//
+// # Decoding
+//
+// [Decode] decodes a GCV like the client's GenericColumnValue.Decode, and
+// [ToStruct] decodes a [cloud.google.com/go/spanner.Row] using the client's
+// `spanner` tag field listing (via
+// [github.com/apstndb/structfields/spannertag]) with the client's ToStruct
+// strictness. Both delegate to the client and extend it only for
+// destination shapes the client rejects today, each tied to an upstream
+// issue:
+//
+//   - pointers to named scalar types as fields
+//     (https://github.com/googleapis/google-cloud-go/issues/12576)
+//   - []T struct slices for ARRAY<STRUCT>, not only []*T
+//     (https://github.com/googleapis/google-cloud-go/issues/11090)
+//   - [encoding/json.RawMessage] destinations for JSON columns
+//     (https://github.com/googleapis/google-cloud-go/issues/10720)
+//
+// When a client release fixes one of these natively, the extension is
+// retired for that version; everything else stays byte-for-byte the
+// client's behavior.
+//
+// # Custom value codecs
+//
+// The client's Go type coverage can be extended per call in both
+// directions, for built-in types the client does not handle (uint32 and the
+// other integer width variants, [time.Duration], ...) and for external
+// types that cannot implement [cloud.google.com/go/spanner.Encoder] /
+// [cloud.google.com/go/spanner.Decoder]. On the encode side:
+//
+//	gcv, err := spancodec.ValueOf(myUint32,
+//	    spancodec.WithValueEncoder(func(v uint32) (spanner.GenericColumnValue, error) {
+//	        return gcvctor.Int64Value(int64(v)), nil
+//	    }))
+//
+// Registered encoders run before the client mirror and match the exact
+// dynamic type; returning [ErrFallthrough] defers to the built-in encoding,
+// the same contract as [github.com/apstndb/spanvalue.FormatConfig] complex
+// plugins. With no registrations the behavior is exactly the client mirror.
+// A registration for T also applies per element of []T; pair it with
+// [WithGoType] so nil and empty slices have an ARRAY element type — a
+// [WithGoType] registration also resolves static inference ([TypeFor],
+// [RowTypeFor], and [RowEncoder.RowType] for encoders constructed with the
+// option). Because registered encoders override ALL built-in handling for
+// their type, registering [time.Time] bypasses the
+// [cloud.google.com/go/spanner.CommitTimestamp] sentinel detection — prefer
+// extending unsupported types over overriding supported ones.
+//
+// [WithValueDecoder] is the decode-side counterpart: registered decoders
+// match the exact destination type *T, run before the extension shapes and
+// the client decode (so they can override both), apply per element when
+// decoding an ARRAY into *[]T, and may return [ErrFallthrough] likewise.
+//
+// There is deliberately no package-global registry (unlike goccy/go-yaml's
+// RegisterCustomMarshaler): like the ignored package-global
+// [cloud.google.com/go/spanner.LossOfPrecisionHandling], mutable global
+// state is avoided in favor of per-call explicitness.
+//
+// # Adoption guide
+//
+// spancodec pays off where rows carry typed columns, PROTO/ENUM cells, NULL
+// styling, or flow into [github.com/apstndb/spanvalue/writer] export. If a
+// code path renders rows whose values are already display strings (a
+// SHOW-style key/value listing of pre-formatted text), building GCVs just
+// to format them back into strings adds work for no display benefit — keep
+// such paths as plain string rows, unless routing them through GCVs buys
+// you a single cell pipeline shared with server results (NULL/type
+// styling, writer export) or scaffolds call sites that will gain typed
+// columns; if you adopt it for that reason, record it in a comment so a
+// later cleanup does not undo it as an accident.
+//
+// That caution is calibrated to per-call-site cost. Once an application has
+// a shared struct-row entry point — one helper that takes a [RowEncoder]
+// plus items and owns formatting, styling, and writer streaming (see
+// executeStructRows in spanner-mycli) — the marginal cost of migrating a
+// fixed-shape statement drops to a struct definition with `spanner` tags,
+// and the shared-pipeline benefit usually clears the bar even for
+// string-only tables. At that point the real reasons NOT to migrate are
+// structural, not cost-based:
+//
+//   - Transposed records: each display row is a different field of one
+//     logical record (vertical key/value layouts). There is no row struct;
+//     the shape is one struct rendered sideways.
+//   - Grouped rows with empty continuation cells: multi-row groups that
+//     leave trailing columns blank on continuation lines. Typed columns
+//     would force a NULL-vs-empty-string output decision; make that
+//     deliberately before migrating, not as a side effect.
+//   - Dynamic column sets: column names computed per execution cannot be a
+//     compile-time struct.
+//   - Pre-rendered text: rows that are already final display strings (DDL
+//     dumps, SQL renderings) gain nothing from a type layer.
+//
+// For display cells, pass encoded values to
+// [github.com/apstndb/spanvalue.FormatRowColumns] instead of writing a
+// per-application GCV-to-string bridge, and detect SQL NULL cells with
+// [github.com/apstndb/spanvalue.IsNull] instead of inspecting the protobuf
+// value kind by hand. Prefer [RowEncoder.Columns] when
+// consumers only need column names; reach for [RowEncoder.ResultSetMetadata]
+// or [RowTypeFor] only when they need Spanner types — switching a consumer
+// from names to metadata typically changes how it renders headers.
+//
+// Formatting of GCVs is owned by [github.com/apstndb/spanvalue], so
+// upgrading spanvalue can change rendered output (for example FLOAT64
+// display); review golden-test diffs from a spanvalue upgrade separately
+// from the spancodec adoption itself. Minimum dependency versions are
+// recorded in the release notes of each version:
+// https://github.com/apstndb/spancodec/releases
+//
+// The package is experimental: the API may change while encodeValue parity
+// is being proven against client library releases.
+package spancodec
