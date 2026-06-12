@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"strconv"
 	"strings"
 	"testing"
@@ -384,5 +385,58 @@ func TestTypeInferenceWithGoType(t *testing.T) {
 	// Without the option the inference still rejects uint32.
 	if _, err := spancodec.TypeFor[uint32](); !errors.Is(err, spancodec.ErrUnsupportedType) {
 		t.Errorf("error = %v, want ErrUnsupportedType", err)
+	}
+}
+
+// TestSliceElementInferencePrecedence pins that a registered element type
+// resolves []T even when the slice type itself is client-native (found by
+// spanpg, apstndb/spanpg#5): inference precedence matches encodeValue —
+// exact []T registration > element registration > client mirror.
+func TestSliceElementInferencePrecedence(t *testing.T) {
+	t.Parallel()
+
+	elemOpt := spancodec.WithGoType[big.Rat](typector.PGNumeric())
+
+	got, err := spancodec.TypeFor[[]big.Rat](elemOpt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := typector.ElemTypeToArrayType(typector.PGNumeric())
+	if diff := cmp.Diff(want, got, protocmp.Transform()); diff != "" {
+		t.Errorf("element registration mismatch (-want +got):\n%s", diff)
+	}
+
+	// An exact registration for the slice type itself still wins.
+	exact := typector.ElemCodeToArrayType(sppb.TypeCode_STRING)
+	gotExact, err := spancodec.TypeFor[[]big.Rat](elemOpt, spancodec.WithGoType[[]big.Rat](exact))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(exact, gotExact, protocmp.Transform()); diff != "" {
+		t.Errorf("exact-slice registration mismatch (-want +got):\n%s", diff)
+	}
+
+	// Struct fields resolve through the same precedence (RowEncoder/RowTypeFor).
+	type row struct {
+		Ns []big.Rat `spanner:"ns"`
+	}
+	rowType, err := spancodec.RowTypeFor[row](elemOpt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRowType := &sppb.StructType{Fields: []*sppb.StructType_Field{
+		typector.NameTypeToStructTypeField("ns", typector.ElemTypeToArrayType(typector.PGNumeric())),
+	}}
+	if diff := cmp.Diff(wantRowType, rowType, protocmp.Transform()); diff != "" {
+		t.Errorf("RowTypeFor mismatch (-want +got):\n%s", diff)
+	}
+
+	// Without options the client-native inference is unchanged.
+	plain, err := spancodec.TypeFor[[]big.Rat]()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(typector.ElemCodeToArrayType(sppb.TypeCode_NUMERIC), plain, protocmp.Transform()); diff != "" {
+		t.Errorf("no-options inference changed (-want +got):\n%s", diff)
 	}
 }
