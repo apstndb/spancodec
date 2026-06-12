@@ -162,6 +162,15 @@ func typeFromGoType(cfg encodeConfig, t reflect.Type) (*sppb.Type, error) {
 	if typ, ok := cfg.goTypes[t]; ok {
 		return proto.Clone(typ).(*sppb.Type), nil
 	}
+	// A registered element type resolves []T BEFORE the exact-type table, so
+	// inference precedence matches encodeValue (where element interception
+	// runs before the mirror switch) even for client-native slice types such
+	// as []big.Rat: exact []T registration > element registration > mirror.
+	if t.Kind() == reflect.Slice {
+		if typ, ok := cfg.goTypes[t.Elem()]; ok {
+			return typector.ElemTypeToArrayType(proto.Clone(typ).(*sppb.Type)), nil
+		}
+	}
 	if ctor, ok := exactGoTypes[t]; ok {
 		return ctor(), nil
 	}
@@ -190,9 +199,6 @@ func typeFromGoType(cfg encodeConfig, t reflect.Type) (*sppb.Type, error) {
 		return structTypeFromGoType(cfg, t)
 	case t.Kind() == reflect.Slice:
 		et := t.Elem()
-		if typ, ok := cfg.goTypes[et]; ok {
-			return typector.ElemTypeToArrayType(proto.Clone(typ).(*sppb.Type)), nil
-		}
 		switch {
 		case et.Implements(protoEnumReflectType):
 			return typector.ElemTypeToArrayType(typector.FQNToEnumType(enumFQNFromGoType(et))), nil
