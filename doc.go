@@ -59,7 +59,8 @@
 //   - [Decode] / [ToStruct]: GCV or [cloud.google.com/go/spanner.Row] →
 //     Go values, delegating to the client with extension shapes; see
 //     "Decoding".
-//   - [WithValueEncoder] / [WithGoType] / [WithValueDecoder]: per-call
+//   - [WithValueEncoder] / [WithGoType] (pre-composed:
+//     [WithTypedValueEncoder]) / [WithValueDecoder]: per-call
 //     injection of codecs for Go types outside the client's coverage; see
 //     "Custom value codecs".
 //

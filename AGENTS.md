@@ -105,7 +105,8 @@ instead of the client's NumberValue / HTML-escaped JSON.
 - `ValuesFromSlice[T]` / `ArrayValueFromSlice[T]` — homogeneous slices;
   interface element types rejected via static inference; nil slice = typed
   NULL ARRAY at the GCV level.
-- `WithValueEncoder[T]` / `WithGoType[T]` (EncodeOption, spanenc#5) —
+- `WithValueEncoder[T]` / `WithGoType[T]` / pre-composed
+  `WithTypedValueEncoder[T](typ, f)` (EncodeOption, spanenc#5) —
   per-call custom encoder injection for client-unsupported Go types
   (uint32, time.Duration, external types); runs BEFORE the mirror,
   `ErrFallthrough` defers to it; exact-type match (interface T panics);

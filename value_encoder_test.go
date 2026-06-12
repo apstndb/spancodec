@@ -440,3 +440,36 @@ func TestSliceElementInferencePrecedence(t *testing.T) {
 		t.Errorf("no-options inference changed (-want +got):\n%s", diff)
 	}
 }
+
+// TestWithTypedValueEncoder pins the pre-composed option's equivalence with
+// WithValueEncoder + WithGoType.
+func TestWithTypedValueEncoder(t *testing.T) {
+	t.Parallel()
+
+	opt := spancodec.WithTypedValueEncoder(typector.Int64(), uint32AsInt64)
+
+	got, err := spancodec.ValueOf(uint32(7), opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(spanner.GenericColumnValue{Type: typector.Int64(), Value: str("7")}, got, protocmp.Transform()); diff != "" {
+		t.Errorf("ValueOf mismatch (-want +got):\n%s", diff)
+	}
+
+	// The type half resolves static inference and nil-slice element types.
+	typ, err := spancodec.TypeFor[uint32](opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(typector.Int64(), typ, protocmp.Transform()); diff != "" {
+		t.Errorf("TypeFor mismatch (-want +got):\n%s", diff)
+	}
+	arr, err := spancodec.ValueOf([]uint32(nil), opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := spanner.GenericColumnValue{Type: typector.ElemCodeToArrayType(sppb.TypeCode_INT64), Value: nullValue()}
+	if diff := cmp.Diff(want, arr, protocmp.Transform()); diff != "" {
+		t.Errorf("nil slice mismatch (-want +got):\n%s", diff)
+	}
+}

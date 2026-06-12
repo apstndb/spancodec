@@ -107,6 +107,24 @@ func WithGoType[T any](typ *sppb.Type) EncodeOption {
 	}
 }
 
+// WithTypedValueEncoder is the pre-composed combination of
+// [WithValueEncoder] and [WithGoType]: it registers f as the encoder for
+// values of exactly type T and typ as T's Spanner type for static inference
+// in one option. Encoder registrations almost always want both halves —
+// without the type, nil and empty []T cannot resolve an ARRAY element type
+// and [TypeFor] / [RowEncoder.RowType] keep failing for T — so dialect
+// adapters and similar option sets otherwise pair the two options for every
+// type (surveyed from spanpg's EncodeOptions). Use the separate options when
+// only one half is wanted.
+func WithTypedValueEncoder[T any](typ *sppb.Type, f func(T) (spanner.GenericColumnValue, error)) EncodeOption {
+	enc := WithValueEncoder(f)
+	gt := WithGoType[T](typ)
+	return func(cfg *encodeConfig) {
+		enc(cfg)
+		gt(cfg)
+	}
+}
+
 // RowEncoderOption configures [NewRowEncoder]. Both option families
 // implement it: [ColumnMaskOption] values configure the column mask, and
 // [EncodeOption] values become the construction-time encoding defaults
