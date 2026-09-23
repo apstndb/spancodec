@@ -47,7 +47,13 @@ func decode(gcv spanner.GenericColumnValue, ptr any, cfg decodeConfig) error {
 				// ErrFallthrough: defer to the built-in path below.
 			} else if t.Elem().Kind() == reflect.Slice && gcv.Type.GetCode() == sppb.TypeCode_ARRAY {
 				if _, ok := cfg.valueDecoders[t.Elem().Elem()]; ok {
-					return decodeCustomSlice(cfg, gcv, reflect.ValueOf(ptr).Elem())
+					rv := reflect.ValueOf(ptr)
+					if rv.IsNil() {
+						// Only the automatic slice path requires a writable destination;
+						// exact registrations above keep their own nil-handling policy.
+						return gcv.Decode(ptr)
+					}
+					return decodeCustomSlice(cfg, gcv, rv.Elem())
 				}
 			}
 		}
@@ -88,15 +94,16 @@ func decodeCustomSlice(cfg decodeConfig, gcv spanner.GenericColumnValue, dst ref
 // decodeExtended reports whether ptr is one of the extension shapes, and if
 // so decodes into it.
 func decodeExtended(gcv spanner.GenericColumnValue, ptr any) (bool, error) {
+	rv := reflect.ValueOf(ptr)
+	if rv.Kind() != reflect.Pointer || rv.IsNil() {
+		return false, nil // let the client produce its usual error
+	}
+
 	// json.RawMessage destination for JSON columns (#10720).
 	if raw, ok := ptr.(*json.RawMessage); ok && gcv.Type.GetCode() == sppb.TypeCode_JSON {
 		return true, decodeJSONRaw(gcv, raw)
 	}
 
-	rv := reflect.ValueOf(ptr)
-	if rv.Kind() != reflect.Pointer || rv.IsNil() {
-		return false, nil // let the client produce its usual error
-	}
 	dst := rv.Elem()
 
 	// Pointer-to-named-scalar destination (*T fields decoded via **T) (#12576).
