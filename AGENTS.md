@@ -39,12 +39,11 @@ against upstream, update the tracked version in `doc.go` and `README.md`, and
 extend `exactGoTypes` (typeof.go) together with the `ValueOf` switch — the
 test suite cross-checks `TypeFromGoType` against `ValueOf` results.
 
-**Spanner version requirements.** Keep the `go.mod` requirement at the
-minimum needed by the APIs in use and this module's dependencies. The current
-minimum is Spanner v1.84.1, required by `spanvalue` v0.8.4. Downstream modules
-can select a newer client under minimal version selection (MVS).
-Raise the requirement when code changes or dependency updates need a higher
-minimum.
+**Spanner version requirements.** Use the audited release as the reference
+for mirrored behavior. Raise the `go.mod` minimum only when the APIs in use
+or the module's dependencies require a higher version. The current minimum
+is Spanner v1.84.1, required by `spanvalue` v0.8.4. Downstream modules can
+select a newer client under minimal version selection (MVS).
 The `latest-deps` CI job tests against spanner@latest to catch drift.
 
 Mirrored quirks are deliberate (do not "fix"): `==` sentinel comparison for
