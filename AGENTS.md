@@ -41,8 +41,8 @@ test suite cross-checks `TypeFromGoType` against `ValueOf` results.
 
 **Spanner version requirements.** Keep the `go.mod` requirement at the
 minimum needed by the APIs in use and this module's dependencies. The current
-`google.golang.org/genproto` dependency requires Spanner v1.87.0. Downstream
-modules can select a newer client under minimal version selection (MVS).
+minimum is Spanner v1.84.1, required by `spanvalue` v0.8.4. Downstream modules
+can select a newer client under minimal version selection (MVS).
 Raise the requirement when code changes or dependency updates need a higher
 minimum.
 The `latest-deps` CI job tests against spanner@latest to catch drift.
