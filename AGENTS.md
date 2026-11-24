@@ -39,11 +39,12 @@ against upstream, update the tracked version in `doc.go` and `README.md`, and
 extend `exactGoTypes` (typeof.go) together with the `ValueOf` switch — the
 test suite cross-checks `TypeFromGoType` against `ValueOf` results.
 
-**Mirrored-semantics version ≠ go.mod requirement.** Keep the Spanner
-requirement at the minimum needed by the APIs in use and the resolved module
-graph. The v1.87.0 requirement comes from spanvalue v0.8.4. Downstream
-modules can select a newer client under MVS. Do NOT bump the requirement
-just because the audited semantics version moved.
+**Spanner version requirements.** Keep the `go.mod` requirement at the
+minimum needed by the APIs in use and this module's dependencies. The current
+`google.golang.org/genproto` dependency requires Spanner v1.87.0. Downstream
+modules can select a newer client under minimal version selection (MVS).
+Raise the requirement when code changes or dependency updates need a higher
+minimum.
 The `latest-deps` CI job tests against spanner@latest to catch drift.
 
 Mirrored quirks are deliberate (do not "fix"): `==` sentinel comparison for
